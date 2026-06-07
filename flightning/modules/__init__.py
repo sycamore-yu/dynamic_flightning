@@ -1,1 +1,1 @@
-from .mlp import MLP, ActorCriticPPO
+from .mlp import MLP, ActorCriticPPO, SHACActor, SHACCritic
