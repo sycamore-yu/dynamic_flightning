@@ -6,6 +6,7 @@ Think Before Coding,每次写代码前列一个task list
 分析问题解决问题给出解决方案时总是给出最佳实践的(context7)文档依据
 禁止只凭记忆回答。
 给用户脚本前应该自己运行一遍确保没有报错后提交
+撰写文档时总是使用中文，所有文档都是
 These rules apply to every task in this project unless explicitly overridden.
 Bias: caution over speed on non-trivial work. Use judgment on trivial tasks.
 
@@ -73,6 +74,7 @@ Default to surfacing uncertainty, not hiding it.
 - Prefer source-backed claims. Cite local code paths and line-level evidence for ownership, data flow, and API boundaries.
 - Treat docs and graphs as maps. Use them to navigate, then confirm final claims against source code.
 - Ask architecture questions only after reading the relevant code. Include the code-based assumption and the recommended answer with each question.
+- Before asking any design or architecture question, first ground the question in reliable facts from existing local code, indexed reference repos, or local papers. State the confirmed facts, the remaining unknown, and the recommended answer; do not ask speculative questions from memory alone.
 - Turn resolved terminology and ownership decisions into project memory immediately, then use those terms consistently.
 - For proposed architecture, list each layer with: upstream caller, owned responsibility, concrete module location, and explicit exclusions handled by another layer.
 - When a term causes confusion, stop expanding the design and repair the glossary first.
@@ -80,7 +82,7 @@ Default to surfacing uncertainty, not hiding it.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rpg_flightning** (729 symbols, 1216 relationships, 22 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rpg_flightning** (1745 symbols, 2472 relationships, 31 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

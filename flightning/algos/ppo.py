@@ -88,7 +88,7 @@ def train(
     num_steps_per_epoch: int,
     num_envs: int,
     key: chex.PRNGKey,
-    config: Config,
+    config: Config = Config(),
 ):
 
     env = LogWrapper(env)

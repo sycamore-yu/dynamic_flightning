@@ -11,6 +11,11 @@ from flightning.envs.env_base import Env, EnvState
 from flightning.envs.wrappers import LogWrapper, VecEnv
 
 
+class Config(NamedTuple):
+    logging: bool = True
+    logging_freq: int = 10
+
+
 class TrajectoryState(PyTreeNode):
     reward: jnp.array
 
@@ -20,12 +25,9 @@ def progress_callback_host(episode_loss):
     print(f"Episode: {episode}, Loss: {loss:.2f}")
 
 
-NUM_EPOCHS_PER_CALLBACK = 10
-
-
-def progress_callback(episode, loss):
+def progress_callback(episode, loss, logging_freq):
     jax.lax.cond(
-        pred=episode % NUM_EPOCHS_PER_CALLBACK == 0,
+        pred=episode % logging_freq == 0,
         true_fun=lambda eps_lss: jax.debug.callback(
             progress_callback_host, eps_lss
         ),
@@ -39,9 +41,9 @@ def grad_callback_host(episode_grad):
     print(f"Episode: {episode}, Grad max: {grad:.4f}")
 
 
-def grad_callback(episode, grad_norm):
+def grad_callback(episode, grad_norm, logging_freq):
     jax.lax.cond(
-        pred=episode % NUM_EPOCHS_PER_CALLBACK == 0,
+        pred=episode % logging_freq == 0,
         true_fun=lambda eps_lss: jax.debug.callback(
             grad_callback_host, eps_lss
         ),
@@ -65,6 +67,7 @@ def train(
     num_steps_per_epoch: int,
     num_envs: int,
     key: chex.PRNGKey,
+    config: Config = Config(),
 ):
 
     env = LogWrapper(env)
@@ -131,8 +134,12 @@ def train(
             grad_vec = jnp.concatenate(flattened_leaves)
             grad_max = jnp.max(jnp.abs(grad_vec))
 
-            progress_callback(epoch_state.epoch_idx, loss)
-            grad_callback(epoch_state.epoch_idx, grad_max)
+            progress_callback(
+                epoch_state.epoch_idx, loss, config.logging_freq
+            )
+            grad_callback(
+                epoch_state.epoch_idx, grad_max, config.logging_freq
+            )
             epoch_state = epoch_state._replace(
                 train_state=train_state, epoch_idx=epoch_state.epoch_idx + 1
             )
@@ -144,7 +151,11 @@ def train(
             epoch_fn, runner_state, None, num_epochs
         )
 
-        return {"runner_state": runner_state_final, "metrics": losses}
+        return {
+            "runner_state": runner_state_final,
+            "loss": losses,
+            "metrics": losses,  # back-compat alias of "loss"
+        }
 
     # intialize environments
     key, key_ = jax.random.split(key)

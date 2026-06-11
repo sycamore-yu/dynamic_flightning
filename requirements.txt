@@ -9,3 +9,6 @@ pyyaml
 jax_dataclasses
 distrax
 jupyterlab
+mujoco
+mujoco-lidar
+rerun-sdk

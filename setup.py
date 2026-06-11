@@ -8,6 +8,8 @@ setup(
     author_email="heeg@ifi.uzh.ch",
     packages=find_packages(),
     install_requires=[
-        # add your project dependencies here
+        "mujoco",
+        "mujoco-lidar",
+        "rerun-sdk",
     ],
 )

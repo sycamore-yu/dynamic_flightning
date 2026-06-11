@@ -300,7 +300,7 @@ class Quadrotor:
 
             state_dot_new = state_dot.replace(
                 p=p_tan, R=R_tan,
-                v=v_tan, dr_key=state.dr_key
+                v=v_tan
             )
 
             return state_new, state_dot_new

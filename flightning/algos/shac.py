@@ -27,6 +27,11 @@ import jax
 import jax.numpy as jnp
 from flax.training.train_state import TrainState
 
+from flightning.algos._common import (
+    clip_grads,
+    ema_update,
+    td_lambda_targets,
+)
 from flightning.envs.env_base import Env, EnvState
 from flightning.envs.wrappers import LogWrapper, VecEnv
 
@@ -60,26 +65,6 @@ class RunnerState(NamedTuple):
     epoch_idx: int
 
 
-NUM_EPOCHS_PER_CALLBACK = 10
-
-
-def _progress_callback_host(payload):
-    epoch, actor_loss, mean_return = payload
-    print(
-        f"[shac] epoch {epoch}: actor_loss={actor_loss:.3f} "
-        f"mean_return={mean_return:.3f}"
-    )
-
-
-def _progress_callback(epoch, actor_loss, mean_return):
-    jax.lax.cond(
-        pred=epoch % NUM_EPOCHS_PER_CALLBACK == 0,
-        true_fun=lambda p: jax.debug.callback(_progress_callback_host, p),
-        false_fun=lambda p: None,
-        operand=(epoch, actor_loss, mean_return),
-    )
-
-
 def _actor_sample_action(key, actor_state, obs, deterministic):
     """Sample actions for a *batch* of obs (one key per env in the batch).
 
@@ -97,39 +82,6 @@ def _actor_sample_action(key, actor_state, obs, deterministic):
         )
 
     return jax.vmap(_single)(key, obs)
-
-
-def _td_lambda_targets(samples, next_values, gamma, lam):
-    """Compute TD-lambda targets V_t = r_t + gamma * [(1-d) * V_{t+1} + d * 0]
-    accumulated with the lambda trace.
-
-    Follows DiffRL's ``SHAC.compute_target_values`` formulation.
-    """
-    rewards = samples.reward     # (T, N)
-    dones = samples.done         # (T, N), float
-    T = rewards.shape[0]
-
-    def _scan_fn(carry, step):
-        Ai_prev, Bi_prev = carry
-        r, d, v_next = step
-        lam_t = lam * (1.0 - d)
-        Ai = (1.0 - d) * (
-            lam * gamma * Ai_prev + gamma * v_next + r
-        )
-        Bi = gamma * (v_next * d + Bi_prev * (1.0 - d)) + r
-        target = (1.0 - lam_t) * Ai + lam_t * Bi
-        return (Ai, Bi), target
-
-    init = (jnp.zeros_like(next_values[0]), jnp.zeros_like(next_values[0]))
-    # Iterate from t=0 to t=T-1; Ai/Bi propagate along the lambda trace.
-    steps = (rewards, dones, next_values[1:])  # next_values is length T+1
-    _, targets_fwd = jax.lax.scan(_scan_fn, init, steps)
-
-    # Fallback: one-step targets (used only if lam == 0 effectively).
-    one_step = rewards + gamma * next_values[1:] * (1.0 - dones)
-    return jax.lax.cond(
-        lam > 0.0, lambda _: targets_fwd, lambda _: one_step, None
-    )
 
 
 def train(
@@ -209,11 +161,11 @@ def train(
         )
 
         # Bootstrap values with the (stop-grad) critic.
-        v_final = _eval_critic(critic_params, final_obs)
+        v_initial = _eval_critic(critic_params, last_obs)
         v_next = _eval_critic(critic_params, samples.next_obs)
-        # Shape: (T+1, N); v_next covers t=0..T-1, v_final is t=T.
+        # Shape: (T+1, N); next_values[t + 1] is V(s_{t+1}).
         next_values = jnp.concatenate(
-            [v_next, v_final[None, ...]], axis=0
+            [v_initial[None, ...], v_next], axis=0
         )  # (T+1, N)
 
         # One-step / discounted-return baseline used as the actor loss
@@ -224,36 +176,29 @@ def train(
 
         def _return_scan(carry, step):
             acc, g = carry
-            r, d, v_tp1 = step
+            r, d, v_tp1, is_final = step
             acc_tp1 = acc + g * r
-            # terminal bootstrap: at done steps the next-step contribution
-            # is zero (reset obs is unrelated to the terminal reward).
-            term = gamma * g * v_tp1 * (1.0 - d)
-            return (acc_tp1 * (1.0 - d), g * gamma * (1.0 - d) + d * gamma), (
-                acc_tp1 + term
-            )
+            bootstrap = gamma * g * v_tp1 * (1.0 - d)
+            boundary = jnp.logical_or(d.astype(bool), is_final)
+            loss_term = jnp.where(boundary, -(acc_tp1 + bootstrap), 0.0)
+            next_acc = jnp.where(d.astype(bool), 0.0, acc_tp1)
+            next_g = jnp.where(d.astype(bool), 1.0, g * gamma)
+            return (next_acc, next_g), loss_term
 
         init = (
             jnp.zeros((num_envs,)),
             jnp.ones((num_envs,)),
         )
-        # Iterate forward; v_next[t] is V(s_{t+1}) for t < T-1, v_final for T-1.
-        steps = (rewards, dones, next_values[1:])
-        _, returns_fwd = jax.lax.scan(_return_scan, init, steps)
-        # Mean over horizon & envs of -return  (maximise return).
-        actor_loss = -returns_fwd.mean()
-        return actor_loss, (samples, next_values)
+        is_final = jnp.arange(num_steps_per_epoch) == (num_steps_per_epoch - 1)
+        steps = (rewards, dones, next_values[1:], is_final)
+        _, loss_terms = jax.lax.scan(_return_scan, init, steps)
+        actor_loss = loss_terms.sum() / (num_steps_per_epoch * num_envs)
+        return actor_loss, (samples, next_values, final_env_state, final_obs)
 
     def _eval_critic(params, obs):
         if use_shared_net:
             return actor_state.apply_fn(params, obs)
         return critic_state.apply_fn(params, obs)
-
-    # ---- critic update ---------------------------------------------------
-    def _eval_critic_with_state(cs, obs):
-        if use_shared_net:
-            return actor_state.apply_fn(cs.params, obs)
-        return cs.apply_fn(cs.params, obs)
 
     # ---- epoch body ------------------------------------------------------
     def _epoch_fn(runner_state, _unused):
@@ -273,19 +218,26 @@ def train(
         actor_grad_fn = jax.value_and_grad(
             _actor_loss_fn, argnums=0, has_aux=True
         )
-        (actor_loss, (samples, next_values)), actor_grads = actor_grad_fn(
+        (
+            actor_loss,
+            (samples, next_values, final_env_state, final_obs),
+        ), actor_grads = actor_grad_fn(
             actor_state.params,
             target_critic_state.params,
             env_state,
             last_obs,
             key_rollout,
         )
-        actor_grads_clipped = _clip_grads(actor_grads, config.max_grad_norm)
+        actor_grads_clipped = clip_grads(actor_grads, config.max_grad_norm)
         actor_state = actor_state.apply_gradients(grads=actor_grads_clipped)
 
         # Compute critic targets (no grad).
-        target_values = _td_lambda_targets(
-            samples, next_values, config.gamma, config.lam
+        target_values = td_lambda_targets(
+            samples.reward,
+            samples.done,
+            next_values,
+            config.gamma,
+            config.lam,
         )  # (T, N)
 
         # Reshape the rollout buffer into a flat dataset of size T*N and
@@ -304,9 +256,7 @@ def train(
             batch_obs, batch_tgt = batch
 
             def _loss(params):
-                v = _eval_critic_with_state(
-                    critic_state.replace(params=params), batch_obs
-                )
+                v = _eval_critic(params, batch_obs)
                 return jnp.mean((v - batch_tgt) ** 2)
 
             loss, grads = jax.value_and_grad(_loss)(critic_state.params)
@@ -330,41 +280,26 @@ def train(
         value_loss = critic_losses[-1]
 
         # EMA update of the target critic.
-        alpha = config.target_critic_alpha
-        new_target_params = jax.tree_util.tree_map(
-            lambda p, pt: alpha * pt + (1.0 - alpha) * p,
+        new_target_params = ema_update(
             critic_state.params,
             target_critic_state.params,
+            config.target_critic_alpha,
         )
         target_critic_state = target_critic_state.replace(
             params=new_target_params
         )
 
-        # Last obs / env state carry over from rollout.
-        metric = {
-            "actor_loss": actor_loss,
-            "returned_episode_returns": samples.info.get(
-                "returned_episode_returns", jnp.zeros(())
-            )[-1].mean()
-            if hasattr(samples, "info") and "info" in samples._fields
-            else jnp.zeros(()),
-        }
+        metric = {"actor_loss": actor_loss, "value_loss": value_loss}
 
         def _log(payload):
-            ep_idx, actor_loss, mean_ret = payload
-            print(
-                f"[shac] epoch {ep_idx}: actor_loss={actor_loss:.3f} "
-                f"mean_return={mean_ret:.3f}"
-            )
+            ep_idx, actor_loss = payload
+            print(f"[shac] epoch {ep_idx}: actor_loss={actor_loss:.3f}")
 
         jax.lax.cond(
             jnp.logical_and(
                 config.logging, epoch_idx % config.logging_freq == 0
             ),
-            lambda _: jax.debug.callback(
-                _log,
-                (epoch_idx, actor_loss, metric.get("returned_episode_returns", 0.0)),
-            ),
+            lambda _: jax.debug.callback(_log, (epoch_idx, actor_loss)),
             lambda _: None,
             None,
         )
@@ -373,8 +308,8 @@ def train(
             actor_state=actor_state,
             critic_state=critic_state,
             target_critic_state=target_critic_state,
-            env_state=env_state,
-            last_obs=last_obs,
+            env_state=final_env_state,
+            last_obs=final_obs,
             key=key,
             epoch_idx=epoch_idx + 1,
         )
@@ -408,14 +343,6 @@ def train(
         epoch_idx=0,
     )
     return jax.jit(_train)(runner_state)
-
-
-def _clip_grads(grads, max_norm):
-    flat, _ = jax.tree_util.tree_flatten(grads)
-    total = sum(jnp.sum(g ** 2) for g in flat if g is not None)
-    norm = jnp.sqrt(total)
-    scale = jnp.minimum(1.0, max_norm / (norm + 1e-6))
-    return jax.tree_util.tree_map(lambda g: g * scale, grads)
 
 
 if __name__ == "__main__":
