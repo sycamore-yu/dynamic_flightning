@@ -8,7 +8,7 @@ from jax import numpy as jnp
 from flightning.envs import HoveringStateEnv
 from flightning.envs.env_base import EnvTransition
 from flightning.envs.hovering_state_env import EnvState
-from flightning.sensors import DoubleSphereCamera, CameraNames
+from flightning.sensors.double_sphere_camera import DoubleSphereCamera, CameraNames
 from flightning.utils import spaces
 from flightning.utils.pytrees import pytree_roll, pytree_at_set
 from flightning.utils.random import key_generator

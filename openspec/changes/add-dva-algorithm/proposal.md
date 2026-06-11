@@ -11,9 +11,10 @@ Flightning 当前已有 `bptt.train(env, train_state, ...)` 和 `shac.train(env,
 - 新增 observation adapter 协议，将现有 Flightning `obs: jax.Array` 显式拆分为 actor observation、critic/state observation，以及可选视觉/传感器 observation。
 - D.VA actor loss MUST 在算法内部对 actor observation 使用 `jax.lax.stop_gradient`，保留 `action -> differentiable env -> reward` 的梯度路径。
 - Critic 默认使用 adapter 提供的 `state_obs`；如果 adapter 未提供 privileged state，则允许回退到 actor observation，以支持现有 state/feature 示例。
-- 新增 state-only 和 vision/feature smoke examples，验证 D.VA 能覆盖类似 `examples/train_bptt_state.ipynb` 和 `examples/train_bptt_vision.ipynb` 的两类任务。
+- 新增 state-only 和 vision/feature smoke examples，脚本优先，验证 D.VA 能覆盖类似 `examples/train_bptt_state.ipynb` 和 `examples/train_bptt_vision.ipynb` 的两类任务；notebook 仅作为可选说明或探索材料，不作为 headless 验收硬门槛。
 - 不修改 `flightning/algos/bptt.py`、`flightning/algos/shac.py` 的公共 API。
 - 不把 D.VA 纳入 `p2m-dynamic-avoidance` change；P2M 迁移继续专注 BPTT/SHAC 路线和可微 LiDAR 观测。
+- 不在本 change 中迁移动动态避障完整训练验收；该验收迁移另开 change，例如 `replace-avoidance-training-validation-with-dva`。
 
 ## Capabilities
 
@@ -31,8 +32,8 @@ Flightning 当前已有 `bptt.train(env, train_state, ...)` 和 `shac.train(env,
 
 - **新增文件**：
   - `flightning/algos/dva.py` — D.VA 算法实现
-  - `examples/train_dva_state.ipynb` 或等价脚本 — state-only D.VA 示例
-  - `examples/train_dva_vision.ipynb` 或等价脚本 — vision/feature D.VA 示例
+  - `examples/train_dva_state.py` — state-only D.VA headless 示例
+  - `examples/train_dva_vision.py` 或等价 feature/vision 脚本 — vision/feature D.VA headless 示例
   - `tests/test_dva.py` — D.VA smoke、adapter 和梯度路径测试
 - **受影响代码**：
   - `flightning/algos/__init__.py` 需要导出 D.VA 入口

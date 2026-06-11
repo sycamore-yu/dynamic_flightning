@@ -18,6 +18,7 @@ class CNNLidarActor(nn.Module):
     nonlinearity: Callable = nn.relu
     initial_scale: float = 1.0
     action_bias: Union[float, jnp.ndarray] = 0.0
+    action_scale: Union[None, float, jnp.ndarray] = None
     initial_log_std: float = 0.0
     min_std: float = 0.05
 
@@ -76,6 +77,9 @@ class CNNLidarActor(nn.Module):
             ),
             bias_init=nn.initializers.zeros,
         )(x)
+
+        if self.action_scale is not None:
+            x = jnp.tanh(x) * self.action_scale
 
         return x + self.action_bias
 

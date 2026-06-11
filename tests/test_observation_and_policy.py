@@ -65,6 +65,16 @@ def test_cnn_policy():
     action_batch = actor.apply(params_actor, obs_batch)
     assert action_batch.shape == (5, 4)
 
+    bounded_actor = CNNLidarActor(
+        feature_list=feature_list,
+        action_bias=jnp.array([7.0, 0.0, 0.0, 0.0]),
+        action_scale=jnp.array([2.0, 1.5, 1.5, 1.0]),
+    )
+    params_bounded = bounded_actor.initialize(key_init)
+    bounded_action = bounded_actor.apply(params_bounded, obs)
+    assert jnp.all(bounded_action <= jnp.array([9.0, 1.5, 1.5, 1.0]) + 1e-5)
+    assert jnp.all(bounded_action >= jnp.array([5.0, -1.5, -1.5, -1.0]) - 1e-5)
+
     value_batch = critic.apply(params_critic, obs_batch)
     assert value_batch.shape == (5,)
 

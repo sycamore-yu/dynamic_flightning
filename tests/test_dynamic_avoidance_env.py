@@ -1,9 +1,20 @@
 import jax
 import jax.numpy as jnp
-from flightning.envs.dynamic_avoidance_env import DynamicAvoidanceEnv, DynamicAvoidanceEnvState
+import pytest
+from flightning.envs.dynamic_avoidance_env import (
+    DynamicAvoidanceEnv,
+    DynamicAvoidanceEnvState,
+    _reset_jit,
+    _step_jit,
+)
 
-def test_env_basic():
-    env = DynamicAvoidanceEnv()
+
+@pytest.fixture(scope="module")
+def env():
+    return DynamicAvoidanceEnv()
+
+
+def test_env_basic(env):
     key = jax.random.PRNGKey(42)
 
     # 1. Reset
@@ -20,8 +31,35 @@ def test_env_basic():
     assert transition.truncated.shape == ()
     assert jnp.isfinite(transition.reward)
 
-def test_env_jit():
-    env = DynamicAvoidanceEnv()
+def test_default_reset_starts_inside_training_bounds(env):
+    keys = jax.random.split(jax.random.PRNGKey(0), 16)
+
+    states, _ = jax.vmap(env.reset)(keys)
+    max_abs_xy = jnp.max(jnp.abs(states.quadrotor_state.p[:, :2]), axis=1)
+    assert bool(jnp.all(max_abs_xy < env.termination_xy_limit))
+
+    actions = jnp.tile(env.hovering_action[None, :], (keys.shape[0], 1))
+    transitions = jax.vmap(env._step)(states, actions, keys)
+    done = transitions.terminated | transitions.truncated
+    assert bool(jnp.mean(done.astype(jnp.float32)) < 1.0)
+
+def test_jitted_functions_reuse_cache_across_default_env_instances(env):
+    key = jax.random.PRNGKey(0)
+    env.reset(key)
+    reset_cache_size = _reset_jit._cache_size()
+    state, _ = env.reset(key)
+    env._step(state, env.hovering_action, key)
+    step_cache_size = _step_jit._cache_size()
+
+    another_env = DynamicAvoidanceEnv()
+    another_state, _ = another_env.reset(key)
+    another_env._step(another_state, another_env.hovering_action, key)
+
+    assert _reset_jit._cache_size() == reset_cache_size
+    assert _step_jit._cache_size() == step_cache_size
+
+
+def test_env_jit(env):
     key = jax.random.PRNGKey(42)
 
     @jax.jit
@@ -33,8 +71,7 @@ def test_env_jit():
     reward = run_reset_step(key)
     assert jnp.isfinite(reward)
 
-def test_env_vmap():
-    env = DynamicAvoidanceEnv()
+def test_env_vmap(env):
     num_envs = 4
     keys = jax.random.split(jax.random.PRNGKey(42), num_envs)
 
@@ -50,8 +87,7 @@ def test_env_vmap():
     assert transitions.obs.shape == (num_envs, 226)
     assert transitions.reward.shape == (num_envs,)
 
-def test_env_scan():
-    env = DynamicAvoidanceEnv()
+def test_env_scan(env):
     key = jax.random.PRNGKey(42)
     state, obs = env.reset(key)
 
@@ -67,8 +103,7 @@ def test_env_scan():
     assert rewards.shape == (10,)
     assert jnp.all(jnp.isfinite(rewards))
 
-def test_env_action_clipping():
-    env = DynamicAvoidanceEnv()
+def test_env_action_clipping(env):
     key = jax.random.PRNGKey(42)
     state, _ = env.reset(key)
 
@@ -80,8 +115,7 @@ def test_env_action_clipping():
     assert jnp.all(applied_action <= env.action_space.high)
     assert jnp.all(applied_action >= env.action_space.low)
 
-def test_env_termination():
-    env = DynamicAvoidanceEnv()
+def test_env_termination(env):
     key = jax.random.PRNGKey(42)
     state, _ = env.reset(key)
 

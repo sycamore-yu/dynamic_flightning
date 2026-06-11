@@ -25,7 +25,7 @@ Flightning 当前算法风格不同：`bptt.train` 和 `shac.train` 由调用方
 
 - 不修改 `bptt.py`、`shac.py`、`ppo.py` 的公共 API。
 - 不要求所有 Flightning env 立即返回 dict observation。
-- 不把 D.VA 作为 `p2m-dynamic-avoidance` 的第一版训练路线。
+- 不在本 change 中迁移动动态避障完整训练验收；该迁移另开 OpenSpec change。
 - 不实现 D.VA 原仓库的 Torch/DFlex/YAML 内部建模框架。
 
 ## API Design
@@ -123,12 +123,29 @@ D.VA actor 更新的核心语义：
 
 **Rationale:** This matches the reference D.VA code behavior where `vis_obs` or `state_obs` is detached before actor forward. The gradient path through action, differentiable dynamics, and reward remains active.
 
+### ADR-005: Keep Dynamic Avoidance Acceptance Migration Separate
+
+**Status:** Accepted
+
+**Decision:** `add-dva-algorithm` provides the generic D.VA algorithm only. Full dynamic avoidance training acceptance migration will be handled by a later change, recommended name `replace-avoidance-training-validation-with-dva`.
+
+**Rationale:** This keeps algorithm ownership separate from P2M/dynamic-avoidance validation ownership. Existing dynamic obstacle, LiDAR, and reward alignment tests remain the numerical alignment layer; training success criteria can move to D.VA in a focused follow-up change.
+
+### ADR-006: Prefer Headless Scripts for Acceptance
+
+**Status:** Accepted
+
+**Decision:** D.VA examples are script-first. Notebooks may exist as optional explanatory artifacts, but scripts and automated tests are the required validation path.
+
+**Rationale:** The project is commonly validated on a remote headless server, and prior notebook-based training acceptance was blocked by resource requirements.
+
 ## Test Strategy
 
 - State-only smoke test: train D.VA for a tiny rollout on `HoveringStateEnv` or an equivalent lightweight env with default adapter, asserting finite metrics and finite gradients.
 - Vision/feature smoke test: train D.VA on `HoveringFeaturesEnv` or equivalent feature observation with adapter, asserting actor observation stop-gradient behavior and critic update.
 - Adapter test: verify custom adapter returns expected actor/critic shapes and works under `jax.jit`/`jax.vmap`.
 - Gradient path test: verify actor gradients are finite and nonzero through `action -> env.step -> reward`, while actor input observation gradients are stopped.
+- Headless script validation: run state-only and feature/vision-style D.VA scripts in the `flightning` conda environment before presenting them as examples.
 
 ## Relationship to P2M Dynamic Avoidance
 

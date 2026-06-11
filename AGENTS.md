@@ -1,6 +1,6 @@
 前是在远程服务器headless模式下运行的
 中文回答
-本项目测试环境使用conda环境 flightning
+本项目测试环境使用conda环境 flightning，不得擅自修改conda下的文件
 当我说最佳实践或best practice时去寻找官方实现中的源码和已有的代码或example来证明
 Think Before Coding,每次写代码前列一个task list
 分析问题解决问题给出解决方案时总是给出最佳实践的(context7)文档依据
@@ -82,7 +82,7 @@ Default to surfacing uncertainty, not hiding it.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **rpg_flightning** (1745 symbols, 2472 relationships, 31 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **rpg_flightning** (2050 symbols, 2891 relationships, 37 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
