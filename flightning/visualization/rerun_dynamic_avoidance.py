@@ -92,9 +92,9 @@ class RerunVizAdapter:
             colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]]
         ))
 
-        # 2. Log Trajectory
+        # 2. Log Trajectory (world-frame sibling, not child of drone transform)
         self.history_positions.append(drone_pos)
-        rr.log("world/drone/path", rr.LineStrips3D([self.history_positions], colors=[[0, 255, 255]]))
+        rr.log("world/trajectory", rr.LineStrips3D([self.history_positions], colors=[[0, 255, 255]]))
 
         # 3. Log Target position
         target_pos = np.array(state.target_pos)
@@ -160,6 +160,6 @@ class RerunVizAdapter:
             world_rays = local_rays @ sensor_mat.T
             hit_points = drone_pos + distances[:, None] * world_rays
             valid_hit_points = hit_points[valid_hit]
-            rr.log("world/drone/lidar/hits", rr.Points3D(valid_hit_points, radii=[0.1], colors=[[255, 0, 0]]))
+            rr.log("world/lidar_hits", rr.Points3D(valid_hit_points, radii=[0.1], colors=[[255, 0, 0]]))
         else:
-            rr.log("world/drone/lidar/hits", rr.Clear(recursive=False))
+            rr.log("world/lidar_hits", rr.Clear(recursive=False))
