@@ -36,6 +36,13 @@ class DynamicAvoidanceConfig:
     reset_inner_extent: float = 20.0
     reset_target_offset: float = 12.0
 
+    # D.VA validation reward proxy parameters
+    clearance_margin: float = 1.5
+    barrier_temperature: float = 0.25
+    ttc_horizon: float = 3.0
+    clearance_weight: float = 5.0
+    motion_risk_weight: float = 5.0
+
     @property
     def termination_xy_limit(self) -> float:
         return self.arena_half_extent - self.termination_margin
@@ -81,6 +88,20 @@ class DynamicAvoidanceEnvState(env_base.EnvState):
     start_pos: jax.Array   # shape (3,)
     dobs_state: DynamicObstacleFieldState
     last_actions: jax.Array  # shape (num_last_actions, 4)
+    prev_clearance: jax.Array  # shape (36,)
+    action_low: jax.Array  # shape (4,)
+    action_high: jax.Array  # shape (4,)
+    clearance_scale: float
+    clearance_delta_scale: float
+    max_episode_steps: int
+
+
+def _compute_clearance_field(scan: jax.Array, static: Any, temperature: float = 0.1) -> jax.Array:
+    s = jnp.squeeze(scan, axis=0) if scan.ndim == 3 else scan
+    d = static.lidar_sensor.cutoff_dist - s  # shape (36, 6)
+    grid = d.reshape(12, 3, 3, 2)
+    clearance = -temperature * jax.scipy.special.logsumexp(-grid / temperature, axis=(1, 3))
+    return clearance.flatten()  # shape (36,)
 
 
 @partial(jax.jit, static_argnames=("static",))
@@ -153,6 +174,21 @@ def _reset_jit(
     thrust_hover = 9.81 * quadrotor._mass
     hovering_action = jnp.array([thrust_hover, 0.0, 0.0, 0.0])
     last_actions = jnp.tile(hovering_action, (cfg.num_last_actions, 1))
+    action_low = jnp.concatenate(
+        [jnp.array([quadrotor._thrust_min * 4.0]), quadrotor._omega_max * -1.0]
+    )
+    action_high = jnp.concatenate(
+        [jnp.array([quadrotor._thrust_max * 4.0]), quadrotor._omega_max]
+    )
+
+    scan = static.lidar_sensor.get_scan(
+        quadrotor_state.p,
+        quadrotor_state.R,
+        dobs_state.pos_xy,
+        stop_lidar_grad=cfg.stop_lidar_grad,
+    )
+
+    clearance_init = _compute_clearance_field(scan, static)
 
     new_state = DynamicAvoidanceEnvState(
         time=0.0,
@@ -162,14 +198,14 @@ def _reset_jit(
         start_pos=start_pos,
         dobs_state=dobs_state,
         last_actions=last_actions,
+        prev_clearance=clearance_init,
+        action_low=action_low,
+        action_high=action_high,
+        clearance_scale=cfg.cutoff_dist,
+        clearance_delta_scale=cfg.cutoff_dist / cfg.ttc_horizon,
+        max_episode_steps=cfg.max_steps_in_episode,
     )
 
-    scan = static.lidar_sensor.get_scan(
-        quadrotor_state.p,
-        quadrotor_state.R,
-        dobs_state.pos_xy,
-        stop_lidar_grad=cfg.stop_lidar_grad,
-    )
     obs = ObservationBuilder.get_observation(
         lidar_scan=scan,
         drone_pos=quadrotor_state.p,
@@ -228,20 +264,29 @@ def _step_jit(
         pos_y_range=(-cfg.termination_xy_limit, cfg.termination_xy_limit),
     )
 
-    next_state = state.replace(
-        time=state.time + cfg.dt,
-        step_idx=state.step_idx + 1,
-        quadrotor_state=quadrotor_state,
-        dobs_state=dobs_state,
-        last_actions=last_actions,
-    )
-
     scan = static.lidar_sensor.get_scan(
         quadrotor_state.p,
         quadrotor_state.R,
         dobs_state.pos_xy,
         stop_lidar_grad=cfg.stop_lidar_grad,
     )
+
+    clearance_curr = _compute_clearance_field(scan, static)
+    delta_d = (clearance_curr - state.prev_clearance) / cfg.dt
+    eps = 1e-8
+    safe_denom = jnp.where(delta_d < 0.0, jnp.maximum(-delta_d, eps), 1.0)
+    ttc = jnp.where(delta_d < 0.0, clearance_curr / safe_denom, cfg.ttc_horizon)
+    ttc = jnp.clip(ttc, 0.0, cfg.ttc_horizon) / cfg.ttc_horizon
+
+    next_state = state.replace(
+        time=state.time + cfg.dt,
+        step_idx=state.step_idx + 1,
+        quadrotor_state=quadrotor_state,
+        dobs_state=dobs_state,
+        last_actions=last_actions,
+        prev_clearance=clearance_curr,
+    )
+
     obs = ObservationBuilder.get_observation(
         lidar_scan=scan,
         drone_pos=quadrotor_state.p,
@@ -269,8 +314,13 @@ def _step_jit(
     terminated = collision_dobs | out_of_bounds | out_of_height | excess_vel | nan_state
     truncated = next_state.step_idx >= cfg.max_steps_in_episode
 
+    info = {
+        "clearance_delta_field": delta_d,
+        "ttc_field": ttc,
+    }
+
     return EnvTransition(
-        next_state, obs, reward, terminated, truncated, dict()
+        next_state, obs, reward, terminated, truncated, info
     )
 
 
@@ -305,14 +355,42 @@ def _get_reward_jit(
 
     max_scan_val = jnp.max(scan)
     min_dist_to_obs = cfg.cutoff_dist - max_scan_val
-    r_clearance = -5.0 * jax.nn.relu(1.5 - min_dist_to_obs) ** 2
+    diff_clearance = (cfg.clearance_margin - min_dist_to_obs) / cfg.barrier_temperature
+    r_clearance = -cfg.clearance_weight * (
+        jax.nn.softplus(diff_clearance)
+    )
 
+    # Object-free motion and TTC risk computed from clearance motion fields
+    d_prev = last_state.prev_clearance
+    d_curr = next_state.prev_clearance
+    delta_d = (d_curr - d_prev) / cfg.dt
+    eps = 1e-8
+    safe_denom = jnp.where(delta_d < 0.0, jnp.maximum(-delta_d, eps), 1.0)
+    ttc = jnp.where(delta_d < 0.0, d_curr / safe_denom, cfg.ttc_horizon)
+
+    ttc = jnp.clip(ttc, 0.0, cfg.ttc_horizon)
+    diff_ttc = (cfg.ttc_horizon - ttc) / cfg.barrier_temperature
+    ttc_barrier = jax.nn.softplus(diff_ttc) - jnp.log(2.0)
+    r_motion_risk = -cfg.motion_risk_weight * jnp.sum(ttc_barrier)
+
+    # Collision hard termination predicate kept separate; wrap fixed event penalty with stop_gradient
     dobs_state = next_state.dobs_state
     dists_to_dobs_xy = jnp.sqrt(jnp.sum((dobs_state.pos_xy - pos[:2]) ** 2, axis=1) + 1e-8)
     dists_to_dobs = dists_to_dobs_xy - dobs_state.radius
-    r_dobs_risk = -5.0 * jnp.sum(jax.nn.relu(1.5 - dists_to_dobs) ** 2)
+    collision_dobs = jnp.any(dists_to_dobs <= 0.2)
+    r_collision = -100.0 * jax.lax.stop_gradient(collision_dobs)
 
-    return r_goal_progress + r_goal_dist + r_speed + r_height + r_action_mag + r_action_smooth + r_clearance + r_dobs_risk
+    return (
+        r_goal_progress
+        + r_goal_dist
+        + r_speed
+        + r_height
+        + r_action_mag
+        + r_action_smooth
+        + r_clearance
+        + r_motion_risk
+        + r_collision
+    )
 
 
 class DynamicAvoidanceEnv(env_base.Env[DynamicAvoidanceEnvState]):
@@ -395,46 +473,7 @@ class DynamicAvoidanceEnv(env_base.Env[DynamicAvoidanceEnvState]):
     def _get_reward(
         self, last_state: DynamicAvoidanceEnvState, next_state: DynamicAvoidanceEnvState, scan: jax.Array
     ) -> jax.Array:
-        # Fetch current and previous state details
-        pos = next_state.quadrotor_state.p
-        prev_pos = last_state.quadrotor_state.p
-        vel = next_state.quadrotor_state.v
-        target = next_state.target_pos
-        last_action = next_state.last_actions[-1]
-        prev_action = last_state.last_actions[-1]
-
-        # 1. Goal Progress
-        dist_to_goal = jnp.sqrt(jnp.sum((target - pos) ** 2) + 1e-8)
-        prev_dist_to_goal = jnp.sqrt(jnp.sum((target - prev_pos) ** 2) + 1e-8)
-        r_goal_progress = (prev_dist_to_goal - dist_to_goal) * 10.0
-        r_goal_dist = -0.5 * dist_to_goal
-
-        # 2. Speed Band
-        vel_mag = jnp.sqrt(jnp.sum(vel ** 2) + 1e-8)
-        r_speed = -1.0 * jax.nn.relu(vel_mag - 5.0) ** 2
-
-        # 3. Height Band
-        r_height = -2.0 * (jax.nn.relu(0.5 - pos[2]) ** 2 + jax.nn.relu(pos[2] - 3.5) ** 2)
-
-        # 4. Action Magnitude (deviation from hover thrust and angular rate size)
-        thrust_hover = 9.81 * self.quadrotor._mass
-        r_action_mag = -0.01 * (last_action[0] - thrust_hover) ** 2 - 0.01 * jnp.sum(last_action[1:] ** 2)
-
-        # 5. Action Smoothness (jerk penalty)
-        r_action_smooth = -0.01 * jnp.sum((last_action - prev_action) ** 2)
-
-        # 6. Soft Obstacle Clearance (minimum clearance in LiDAR scan)
-        max_scan_val = jnp.max(scan)
-        min_dist_to_obs = self.cutoff_dist - max_scan_val
-        r_clearance = -5.0 * jax.nn.relu(1.5 - min_dist_to_obs) ** 2
-
-        # 7. Dynamic Obstacles Risk (using explicit positions)
-        dobs_state = next_state.dobs_state
-        dists_to_dobs_xy = jnp.sqrt(jnp.sum((dobs_state.pos_xy - pos[:2]) ** 2, axis=1) + 1e-8)
-        dists_to_dobs = dists_to_dobs_xy - dobs_state.radius
-        r_dobs_risk = -5.0 * jnp.sum(jax.nn.relu(1.5 - dists_to_dobs) ** 2)
-
-        return r_goal_progress + r_goal_dist + r_speed + r_height + r_action_mag + r_action_smooth + r_clearance + r_dobs_risk
+        return _get_reward_jit(last_state, next_state, scan, self._static)
 
     def compute_p2m_reward(
         self, last_state: DynamicAvoidanceEnvState, next_state: DynamicAvoidanceEnvState, scan: jax.Array
@@ -550,3 +589,87 @@ class DynamicAvoidanceEnv(env_base.Env[DynamicAvoidanceEnvState]):
     @property
     def observation_space(self) -> spaces.Box:
         return ObservationBuilder.get_observation_space(self.action_space, self.cutoff_dist)
+
+
+def dynamic_avoidance_dva_adapter(
+    obs: jax.Array,
+    env_state: Any,
+    info: Optional[Dict[str, Any]] = None,
+) -> Any:
+    from flightning.algos.dva import DVAObservation
+
+    def _adapter_single(o, es, inf):
+        state = es
+        while hasattr(state, "env_state"):
+            state = state.env_state
+
+        pos = state.quadrotor_state.p
+        R = state.quadrotor_state.R
+        vel = state.quadrotor_state.v
+        omega = state.quadrotor_state.omega
+
+        # ego_state (10)
+        height_norm = pos[2] / 3.5
+        v_body = R.T @ vel / 10.0
+        heading = R[:, 0]
+        omega_norm = omega / 5.0
+
+        ego_state = jnp.concatenate([
+            jnp.array([height_norm]),
+            v_body,
+            heading,
+            omega_norm
+        ])
+
+        # goal_state (4)
+        target_pos = state.target_pos
+        rpos = target_pos - pos
+        dist = jnp.sqrt(jnp.sum(rpos ** 2) + 1e-8)
+        target_dir = rpos / dist
+        target_dir_body = R.T @ target_dir
+        dist_norm = jnp.clip(dist / 20.0, 0.0, 1.0)
+
+        goal_state = jnp.concatenate([
+            target_dir_body,
+            jnp.array([dist_norm])
+        ])
+
+        # clearance_field (36)
+        clearance_field = jnp.clip(state.prev_clearance / state.clearance_scale, 0.0, 1.0)
+
+        # clearance_delta_field (36) & ttc_field (36)
+        if inf is not None and "clearance_delta_field" in inf:
+            clearance_delta_field = jnp.clip(
+                inf["clearance_delta_field"] / state.clearance_delta_scale,
+                -1.0,
+                1.0,
+            )
+            ttc_field = inf["ttc_field"]
+        else:
+            clearance_delta_field = jnp.zeros((36,))
+            ttc_field = jnp.ones((36,))
+
+        last_action = state.last_actions[-1]
+        action_span = jnp.maximum(state.action_high - state.action_low, 1e-6)
+        last_action = 2.0 * (last_action - state.action_low) / action_span - 1.0
+        last_action = jnp.clip(last_action, -1.0, 1.0)
+        progress = jnp.array([state.step_idx / jnp.maximum(state.max_episode_steps, 1)])
+
+        critic_obs = jnp.concatenate([
+            ego_state,
+            goal_state,
+            clearance_field,
+            clearance_delta_field,
+            ttc_field,
+            last_action,
+            progress
+        ])
+
+        return DVAObservation(actor_obs=o, critic_obs=critic_obs)
+
+    # Handle batching
+    if obs.ndim == 1:
+        return _adapter_single(obs, env_state, info)
+    else:
+        in_axes = (0, 0, 0 if info is not None else None)
+        return jax.vmap(_adapter_single, in_axes=in_axes)(obs, env_state, info)

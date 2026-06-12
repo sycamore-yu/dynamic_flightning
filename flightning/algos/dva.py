@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable, NamedTuple, Optional
+from typing import Any, Callable, Dict, NamedTuple, Optional
 
 import chex
 import jax
@@ -25,6 +25,7 @@ class DVAConfig(NamedTuple):
     max_grad_norm: float = 1.0
     logging_freq: int = 10
     logging: bool = True
+    allow_actor_critic_obs_fallback: bool = False
 
 
 class DVAObservation(NamedTuple):
@@ -32,8 +33,65 @@ class DVAObservation(NamedTuple):
     critic_obs: jax.Array
 
 
-def default_observation_adapter(obs: jax.Array) -> DVAObservation:
+def default_observation_adapter(
+    obs: jax.Array,
+    env_state: Optional[EnvState] = None,
+    info: Optional[Dict[str, Any]] = None,
+) -> DVAObservation:
     return DVAObservation(actor_obs=obs, critic_obs=obs)
+
+
+def _call_adapter(adapter, obs, env_state=None, info=None):
+    import inspect
+
+    try:
+        sig = inspect.signature(adapter)
+        has_var_args = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
+        if has_var_args:
+            return adapter(obs, env_state, info)
+        pos_args = [p for p in sig.parameters.values() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        num_args = len(pos_args)
+    except Exception:
+        num_args = 1
+
+    if num_args >= 3:
+        return adapter(obs, env_state, info)
+    if num_args == 2:
+        return adapter(obs, env_state)
+    return adapter(obs)
+
+
+def _is_dynamic_avoidance_env(env: Env) -> bool:
+    base_env = getattr(env, "unwrapped", env)
+    return type(base_env).__name__ == "DynamicAvoidanceEnv"
+
+
+def _validate_dynamic_avoidance_observation_adapter(
+    *,
+    env: Env,
+    observation_adapter: Callable[..., DVAObservation],
+    config: DVAConfig,
+    obs: Optional[jax.Array] = None,
+    env_state: Optional[EnvState] = None,
+) -> None:
+    if not _is_dynamic_avoidance_env(env) or config.allow_actor_critic_obs_fallback:
+        return
+
+    if observation_adapter is default_observation_adapter:
+        raise ValueError(
+            "DynamicAvoidanceEnv D.VA validation requires a privileged critic observation adapter; "
+            "pass dynamic_avoidance_dva_adapter or set allow_actor_critic_obs_fallback=True for an explicit ablation."
+        )
+
+    if obs is None or env_state is None:
+        return
+
+    dva_obs = _call_adapter(observation_adapter, obs, env_state)
+    if dva_obs.actor_obs.shape == dva_obs.critic_obs.shape:
+        raise ValueError(
+            "DynamicAvoidanceEnv D.VA validation requires critic_obs derived from privileged state; "
+            "critic_obs currently has the actor observation shape."
+        )
 
 
 class DVASample(NamedTuple):
@@ -42,6 +100,38 @@ class DVASample(NamedTuple):
     reward: jax.Array
     done: jax.Array
     next_obs: jax.Array
+    critic_obs: jax.Array
+    next_critic_obs: jax.Array
+    terminated: jax.Array
+    truncated: jax.Array
+
+
+def _dva_actor_loss_terms(
+    rewards: jax.Array,
+    dones: jax.Array,
+    terminated: jax.Array,
+    next_values: jax.Array,
+    gamma: float,
+) -> jax.Array:
+    def _return_scan(carry, step):
+        acc, g = carry
+        r, d, term, v_tp1, is_final = step
+        acc_tp1 = acc + g * r
+        bootstrap = gamma * g * v_tp1 * (1.0 - term)
+        boundary = jnp.logical_or(d.astype(bool), is_final)
+        loss_term = jnp.where(boundary, -(acc_tp1 + bootstrap), 0.0)
+        next_acc = jnp.where(d.astype(bool), 0.0, acc_tp1)
+        next_g = jnp.where(d.astype(bool), 1.0, g * gamma)
+        return (next_acc, next_g), loss_term
+
+    init = (
+        jnp.zeros_like(rewards[0]),
+        jnp.ones_like(rewards[0]),
+    )
+    is_final = jnp.arange(rewards.shape[0]) == (rewards.shape[0] - 1)
+    steps = (rewards, dones, terminated, next_values, is_final)
+    _, loss_terms = jax.lax.scan(_return_scan, init, steps)
+    return loss_terms
 
 
 class RunnerState(NamedTuple):
@@ -74,7 +164,7 @@ def train(
     actor_state: TrainState,
     critic_state: Optional[TrainState] = None,
     *,
-    observation_adapter: Callable[[jax.Array], DVAObservation] = default_observation_adapter,
+    observation_adapter: Callable[..., DVAObservation] = default_observation_adapter,
     num_epochs: int = 100,
     num_steps_per_epoch: int = 50,
     num_envs: int = 64,
@@ -82,6 +172,11 @@ def train(
     config: DVAConfig = DVAConfig(),
 ):
     """Train a policy with D.VA (Decoupled Visual-Based Analytical Policy Gradient)."""
+    _validate_dynamic_avoidance_observation_adapter(
+        env=env,
+        observation_adapter=observation_adapter,
+        config=config,
+    )
     env = LogWrapper(env)
     env = VecEnv(env)
     use_shared_net = critic_state is None
@@ -95,7 +190,7 @@ def train(
             key_step = jax.random.split(key_step, num_envs)
 
             # Map observation using adapter
-            dva_obs = observation_adapter(last_obs)
+            dva_obs = _call_adapter(observation_adapter, last_obs, env_state)
             # Stop gradient on actor observation inside the algorithm before forward pass
             actor_obs_stop = jax.lax.stop_gradient(dva_obs.actor_obs)
 
@@ -107,12 +202,25 @@ def train(
             done = jnp.logical_or(trans.terminated, trans.truncated).astype(
                 jnp.float32
             )
+
+            # Map next observation before reset
+            next_dva_obs_pre = _call_adapter(
+                observation_adapter,
+                trans.info["pre_reset_obs"],
+                trans.info["pre_reset_state"],
+                trans.info,
+            )
+
             sample = DVASample(
                 obs=last_obs,
                 action=action,
                 reward=trans.reward,
                 done=done,
                 next_obs=trans.obs,
+                critic_obs=dva_obs.critic_obs,
+                next_critic_obs=next_dva_obs_pre.critic_obs,
+                terminated=trans.terminated.astype(jnp.float32),
+                truncated=trans.truncated.astype(jnp.float32),
             )
             return (
                 (actor_state, trans.state, trans.obs),
@@ -137,38 +245,27 @@ def train(
         )
 
         # Bootstrap values with the (stop-grad) target critic
-        dva_obs_initial = observation_adapter(last_obs)
-        dva_obs_next = observation_adapter(samples.next_obs)
+        dva_obs_initial = _call_adapter(observation_adapter, last_obs, env_state)
 
         v_initial = _eval_critic(critic_params, dva_obs_initial.critic_obs)
-        v_next = _eval_critic(critic_params, dva_obs_next.critic_obs)
+        v_next = _eval_critic(critic_params, samples.next_critic_obs)
+        # Apply terminal mask to next values (zero out early termination but not truncation)
+        v_next_masked = v_next * (1.0 - samples.terminated)
         # Shape: (T+1, N); next_values[t + 1] is V(s_{t+1}).
         next_values = jnp.concatenate(
-            [v_initial[None, ...], v_next], axis=0
+            [v_initial[None, ...], v_next_masked], axis=0
         )  # (T+1, N)
 
         rewards = samples.reward                 # (T, N)
         dones = samples.done                     # (T, N)
-        gamma = config.gamma
-
-        def _return_scan(carry, step):
-            acc, g = carry
-            r, d, v_tp1, is_final = step
-            acc_tp1 = acc + g * r
-            bootstrap = gamma * g * v_tp1 * (1.0 - d)
-            boundary = jnp.logical_or(d.astype(bool), is_final)
-            loss_term = jnp.where(boundary, -(acc_tp1 + bootstrap), 0.0)
-            next_acc = jnp.where(d.astype(bool), 0.0, acc_tp1)
-            next_g = jnp.where(d.astype(bool), 1.0, g * gamma)
-            return (next_acc, next_g), loss_term
-
-        init = (
-            jnp.zeros((num_envs,)),
-            jnp.ones((num_envs,)),
+        terminated = samples.terminated           # (T, N)
+        loss_terms = _dva_actor_loss_terms(
+            rewards,
+            dones,
+            terminated,
+            next_values[1:],
+            config.gamma,
         )
-        is_final = jnp.arange(num_steps_per_epoch) == (num_steps_per_epoch - 1)
-        steps = (rewards, dones, next_values[1:], is_final)
-        _, loss_terms = jax.lax.scan(_return_scan, init, steps)
         actor_loss = loss_terms.sum() / (num_steps_per_epoch * num_envs)
         return actor_loss, (samples, next_values, final_env_state, final_obs)
 
@@ -218,13 +315,12 @@ def train(
                 config.lam,
             )  # (T, N)
         elif config.critic_method == "one-step":
-            target_values = samples.reward + config.gamma * next_values[1:] * (1.0 - samples.done)
+            target_values = samples.reward + config.gamma * next_values[1:] * (1.0 - samples.terminated)
         else:
             raise ValueError(f"Unknown critic method: {config.critic_method}")
 
-        # Map buffer obs using adapter to get critic_obs for dataset
-        dva_obs_all = observation_adapter(samples.obs)
-        flat_critic_obs = dva_obs_all.critic_obs.reshape((-1,) + dva_obs_all.critic_obs.shape[2:])
+        # Use critic_obs stored in samples
+        flat_critic_obs = samples.critic_obs.reshape((-1,) + samples.critic_obs.shape[2:])
         flat_targets = target_values.reshape((-1,))
 
         total = flat_critic_obs.shape[0]
@@ -311,6 +407,13 @@ def train(
     key, key_reset = jax.random.split(key)
     reset_keys = jax.random.split(key_reset, num_envs)
     env_state, obs = env.reset(reset_keys, None)
+    _validate_dynamic_avoidance_observation_adapter(
+        env=env,
+        observation_adapter=observation_adapter,
+        config=config,
+        obs=obs,
+        env_state=env_state,
+    )
 
     if use_shared_net:
         critic_state = actor_state

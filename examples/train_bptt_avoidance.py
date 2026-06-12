@@ -91,9 +91,8 @@ def main():
         # Predict deterministic action
         action = trained_state.apply_fn(trained_state.params, obs)
         
-        # Log to rerun
         # scan is decoded from the first 216 dimensions of obs
-        scan = env.cutoff_dist - obs[:216].reshape(1, 36, 6)
+        scan = obs[:216].reshape(1, 36, 6)
         viz.log_state(state, scan, step_idx=step)
         
         # Step environment

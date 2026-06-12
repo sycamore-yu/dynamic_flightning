@@ -5,6 +5,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import optax
+import pytest
 from flax.training.train_state import TrainState
 
 from flightning.envs import HoveringStateEnv
@@ -14,6 +15,7 @@ from flightning.algos.dva import (
     train as train_dva,
     DVAConfig,
     DVAObservation,
+    _dva_actor_loss_terms,
 )
 
 
@@ -225,3 +227,131 @@ def test_dva_critic_update_smoke():
 
     assert jnp.isfinite(result["metrics"]["actor_loss"][-1])
     assert jnp.isfinite(result["metrics"]["value_loss"][-1])
+
+
+def test_dynamic_avoidance_dva_finite_metrics():
+    """Verify that training on DynamicAvoidanceEnv with dynamic_avoidance_dva_adapter
+    and stop_lidar_grad=True produces finite actor and critic metrics.
+    """
+    from flightning.envs.dynamic_avoidance_env import (
+        DynamicAvoidanceEnv,
+        dynamic_avoidance_dva_adapter,
+    )
+    from flightning.modules.cnn_lidar_policy import CNNLidarActor
+
+    # We use stop_lidar_grad=True to prevent unstable/NaN visual gradients
+    env = DynamicAvoidanceEnv(stop_lidar_grad=True)
+
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+    actor_model = CNNLidarActor(feature_list=[442, 32, action_dim])
+    critic_model = SHACCritic(feature_list=[127, 32, 1])
+
+    key = jax.random.PRNGKey(42)
+    key_init, key_train = jax.random.split(key, 2)
+    key_actor, key_critic = jax.random.split(key_init)
+
+    actor_state = TrainState.create(
+        apply_fn=actor_model.apply,
+        params=actor_model.initialize(key_actor),
+        tx=optax.adam(1e-3),
+    )
+    critic_state = TrainState.create(
+        apply_fn=critic_model.apply,
+        params=critic_model.initialize(key_critic),
+        tx=optax.adam(1e-3),
+    )
+
+    config = DVAConfig(
+        logging=False,
+        critic_iterations=1,
+        num_batches=1,
+        critic_method="td-lambda",
+        max_grad_norm=1.0,
+    )
+
+    result = train_dva(
+        env=env,
+        actor_state=actor_state,
+        critic_state=critic_state,
+        observation_adapter=dynamic_avoidance_dva_adapter,
+        num_epochs=1,
+        num_steps_per_epoch=2,
+        num_envs=2,
+        key=key_train,
+        config=config,
+    )
+
+    assert "runner_state" in result
+    assert "metrics" in result
+    assert jnp.isfinite(result["metrics"]["actor_loss"][-1])
+    assert jnp.isfinite(result["metrics"]["value_loss"][-1])
+
+
+def test_dynamic_avoidance_dva_requires_privileged_adapter():
+    from flightning.envs.dynamic_avoidance_env import DynamicAvoidanceEnv
+    from flightning.modules.cnn_lidar_policy import CNNLidarActor
+
+    env = DynamicAvoidanceEnv(stop_lidar_grad=True)
+    action_dim = env.action_space.shape[0]
+
+    actor_model = CNNLidarActor(feature_list=[442, 16, action_dim])
+    critic_model = SHACCritic(feature_list=[226, 16, 1])
+
+    key = jax.random.PRNGKey(7)
+    key_actor, key_critic, key_train = jax.random.split(key, 3)
+    actor_state = TrainState.create(
+        apply_fn=actor_model.apply,
+        params=actor_model.initialize(key_actor),
+        tx=optax.adam(1e-3),
+    )
+    critic_state = TrainState.create(
+        apply_fn=critic_model.apply,
+        params=critic_model.initialize(key_critic),
+        tx=optax.adam(1e-3),
+    )
+
+    with pytest.raises(ValueError, match="privileged critic observation adapter"):
+        train_dva(
+            env=env,
+            actor_state=actor_state,
+            critic_state=critic_state,
+            num_epochs=1,
+            num_steps_per_epoch=1,
+            num_envs=1,
+            key=key_train,
+            config=DVAConfig(logging=False, critic_iterations=1, num_batches=1),
+        )
+
+
+def test_dva_bootstrap_semantics():
+    """Verify D.VA's done/truncated bootstrap contract:
+    - Early termination (terminated=1) zeros out bootstrap value.
+    - Time-limit truncation (truncated=1, terminated=0) preserves bootstrap value.
+    """
+    gamma = 0.99
+
+    # Case 1: Early termination at step 0 (terminated=1, done=1)
+    rewards = jnp.array([[-1.0]])
+    dones = jnp.array([[1.0]])
+    terminated = jnp.array([[1.0]])
+    next_values = jnp.array([[10.0]])  # V(s_1) = 10.0
+    loss_terms = _dva_actor_loss_terms(rewards, dones, terminated, next_values, gamma)
+
+    # Loss term should be -(acc_tp1 + bootstrap) = -(-1.0 + 0.0) = 1.0
+    assert jnp.allclose(loss_terms[0], 1.0)
+
+    # Case 2: Time-limit truncation at step 0 (terminated=0, done=1, truncated=1)
+    terminated_trunc = jnp.array([[0.0]])
+    loss_terms_trunc = _dva_actor_loss_terms(
+        rewards,
+        dones,
+        terminated_trunc,
+        next_values,
+        gamma,
+    )
+
+    # Loss term should be -(acc_tp1 + bootstrap) = -(-1.0 + gamma * 1.0 * 10.0) = -(8.9) = -8.9
+    expected = -(-1.0 + gamma * 10.0)
+    assert jnp.allclose(loss_terms_trunc[0], expected)

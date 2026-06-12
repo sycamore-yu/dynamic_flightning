@@ -68,6 +68,14 @@ _避免_: 把深度图只当作不可导的外部输入。
 LiDAR distance image 仍在前向传播中生成并输入策略，但使用 `stop_gradient` 阻断观测模型对环境状态的反向依赖，作为稳定性对照。
 _避免_: 误以为阻断 LiDAR 梯度会阻断 policy action 到动力学和 reward 的所有梯度。
 
+**DVA headless smoke validation**:
+在 `flightning` conda 环境中运行 D.VA 脚本或测试，验证编译、rollout、privileged critic schema、bootstrap 语义和 actor/critic metrics 有限。
+_避免_: 把 finite metrics 或 critic loss 下降理解为策略已经学会动态避障或到达目标。
+
+**Dynamic avoidance policy convergence**:
+策略收敛必须用真实 actor policy 的闭环评估证明，包括到达目标、避免碰撞、最小目标距离、episode 长度、成功率和 Rerun 轨迹；手写目标导向控制器只能作为可视化/动力学参考。
+_避免_: 用目标导向参考控制器生成的 Rerun 轨迹证明 D.VA actor policy 收敛。
+
 **PRD**:
 某个具体提案的需求合同，描述目标、范围、组件、决策、测试和未决项。
 _避免_: 把 PRD 当成全局术语表。
@@ -90,6 +98,7 @@ _避免_: 把一次提案的临时任务清单写成全局事实。
 - **动态障碍物状态机**属于任务语义，必须由 JAX PRNG 显式驱动以兼容 `jit` 和 `scan`。
 - **CNN LiDAR 策略**消费 **LiDAR 图像观测**和状态特征，输出**低层动作接口**动作。
 - **解析 LiDAR 梯度**是第一版默认视觉梯度策略；**阻断 LiDAR 梯度**是稳定性对照。
+- **DVA headless smoke validation**只证明 D.VA 动态避障验证路径可运行；**Dynamic avoidance policy convergence**需要真实 actor policy 的闭环成功率和避障行为评估。
 - **CONTEXT**是全局语言；**PRD**是单个迁移提案的需求与验收范围。
 
 ## 示例对话
@@ -123,3 +132,4 @@ _避免_: 把一次提案的临时任务清单写成全局事实。
 - 迁移验证采用 P2M 数值对齐作为主要验收方式。
 - 第一条端到端训练验收使用 BPTT；SHAC 后续仍需支持，但不是首个闭环验收目标。
 - dobs_state 状态机等补充细节的具体源码来源暂缓，等待用户后续提供；在提供前不得把这些细节宣称为当前 P2M 主分支源码事实。
+- D.VA 动态避障当前验收范围是 headless smoke validation：finite actor/critic metrics、privileged critic observation、done/truncated bootstrap 和 reward proxy 数值稳定。真实 actor policy 的有效避障、绕障和到达终点收敛仍是后续工作。

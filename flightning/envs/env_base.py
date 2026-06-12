@@ -53,6 +53,11 @@ class Env(Generic[TEnvState]):
         state = tree_select(done, reset_state, step_state)
         obs = tree_select(done, reset_obs, step_obs)
 
+        # Preserve pre-reset state and observation for algorithms like D.VA
+        info = info.copy() if info is not None else {}
+        info["pre_reset_state"] = step_state
+        info["pre_reset_obs"] = step_obs
+
         return EnvTransition(state, obs, reward, terminated, truncated, info)
 
     @partial(jax.jit, static_argnums=(0,))

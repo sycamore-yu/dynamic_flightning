@@ -6,6 +6,8 @@ from flightning.envs.dynamic_avoidance_env import (
     DynamicAvoidanceEnvState,
     _reset_jit,
     _step_jit,
+    _compute_clearance_field,
+    dynamic_avoidance_dva_adapter,
 )
 
 
@@ -131,3 +133,94 @@ def test_env_termination(env):
     bad_state2 = state.replace(quadrotor_state=bad_quad_state2)
     transition2 = env._step(bad_state2, env.hovering_action, key)
     assert transition2.terminated == True
+
+
+def test_reward_proxy_numerical_stability(env):
+    key = jax.random.PRNGKey(42)
+    state, _ = env.reset(key)
+
+    # Helper to compute reward and its gradient with respect to drone position p
+    def get_reward_and_grad(pos, prev_pos, current_scan, prev_clearance=None):
+        if prev_clearance is None:
+            prev_clearance = jnp.ones(36) * 10.0
+
+        def f(p):
+            quad_state = state.quadrotor_state.replace(p=p)
+            last_state = state.replace(
+                quadrotor_state=state.quadrotor_state.replace(p=prev_pos),
+                prev_clearance=prev_clearance
+            )
+            curr_clearance = _compute_clearance_field(current_scan, env._static)
+            next_state = state.replace(
+                quadrotor_state=quad_state,
+                prev_clearance=curr_clearance
+            )
+            reward = env._get_reward(last_state, next_state, current_scan)
+            return reward
+
+        val, grad = jax.value_and_grad(f)(pos)
+        return val, grad
+
+    # Scene 1: Safe-clearance scene
+    pos_safe = jnp.array([0.0, 0.0, 2.0])
+    prev_pos_safe = jnp.array([0.0, 0.0, 2.0])
+    scan_safe = jnp.zeros((1, 36, 6))
+    val_safe, grad_safe = get_reward_and_grad(pos_safe, prev_pos_safe, scan_safe)
+    assert jnp.isfinite(val_safe)
+    assert jnp.all(jnp.isfinite(grad_safe))
+
+    # Scene 2: Near-collision scene (obstacle very close)
+    pos_near = jnp.array([0.0, 0.0, 2.0])
+    prev_pos_near = jnp.array([0.0, 0.0, 2.0])
+    scan_near = jnp.ones((1, 36, 6)) * 9.79
+    val_near, grad_near = get_reward_and_grad(pos_near, prev_pos_near, scan_near)
+    assert jnp.isfinite(val_near)
+    assert jnp.all(jnp.isfinite(grad_near))
+
+    # Scene 3: Near-zero relative-velocity scene
+    pos_zero_vel = jnp.array([0.0, 0.0, 2.0])
+    prev_pos_zero_vel = jnp.array([0.0, 0.0, 2.0])
+    scan_zero_vel = jnp.ones((1, 36, 6)) * 8.0
+    curr_clearance = _compute_clearance_field(scan_zero_vel, env._static)
+    val_zv, grad_zv = get_reward_and_grad(pos_zero_vel, prev_pos_zero_vel, scan_zero_vel, prev_clearance=curr_clearance)
+    assert jnp.isfinite(val_zv)
+    assert jnp.all(jnp.isfinite(grad_zv))
+
+
+def test_clearance_proxy_has_gradient_outside_margin(env):
+    key = jax.random.PRNGKey(0)
+    state, _ = env.reset(key)
+
+    scan = jnp.zeros((1, 36, 6))
+    scan = scan.at[0, 0, 0].set(env.config.cutoff_dist - (env.config.clearance_margin + 0.5))
+    curr_clearance = _compute_clearance_field(scan, env._static)
+    next_state = state.replace(prev_clearance=curr_clearance)
+
+    def reward_from_scan(scan_value):
+        scan_with_value = scan.at[0, 0, 0].set(scan_value)
+        scan_clearance = _compute_clearance_field(scan_with_value, env._static)
+        state_with_clearance = next_state.replace(prev_clearance=scan_clearance)
+        return env._get_reward(state, state_with_clearance, scan_with_value)
+
+    grad = jax.grad(reward_from_scan)(scan[0, 0, 0])
+    assert jnp.isfinite(grad)
+    assert jnp.abs(grad) > 0.0
+
+
+def test_dynamic_avoidance_dva_adapter_scaled_schema(env):
+    key = jax.random.PRNGKey(1)
+    state, obs = env.reset(key)
+    transition = env._step(state, env.hovering_action, key)
+
+    adapted = dynamic_avoidance_dva_adapter(
+        transition.obs,
+        transition.state,
+        transition.info,
+    )
+
+    assert adapted.actor_obs.shape == (226,)
+    assert adapted.critic_obs.shape == (127,)
+    assert jnp.all(jnp.isfinite(adapted.critic_obs))
+    assert jnp.all((adapted.critic_obs[14:50] >= 0.0) & (adapted.critic_obs[14:50] <= 1.0))
+    assert jnp.all((adapted.critic_obs[50:86] >= -1.0) & (adapted.critic_obs[50:86] <= 1.0))
+    assert jnp.all((adapted.critic_obs[122:126] >= -1.0) & (adapted.critic_obs[122:126] <= 1.0))
