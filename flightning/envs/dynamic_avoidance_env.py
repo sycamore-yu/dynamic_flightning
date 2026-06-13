@@ -42,6 +42,9 @@ class DynamicAvoidanceConfig:
     ttc_horizon: float = 3.0
     clearance_weight: float = 5.0
     motion_risk_weight: float = 5.0
+    dobs_vel_range: tuple[float, float] = (1.0, 5.0)
+    dobs_radius_range: tuple[float, float] = (0.25, 0.45)
+    reset_obstacle_clearance: float = 0.0
 
     @property
     def termination_xy_limit(self) -> float:
@@ -169,7 +172,24 @@ def _reset_jit(
         key_dobs,
         pos_x_range=(-cfg.termination_xy_limit, cfg.termination_xy_limit),
         pos_y_range=(-cfg.termination_xy_limit, cfg.termination_xy_limit),
+        vel_range=cfg.dobs_vel_range,
+        rad_range=cfg.dobs_radius_range,
     )
+    if cfg.reset_obstacle_clearance > 0.0:
+        vec_from_start = dobs_state.pos_xy - start_pos[:2]
+        dist_from_start = jnp.sqrt(jnp.sum(vec_from_start ** 2, axis=1) + 1e-8)
+        safe_dir = vec_from_start / dist_from_start[:, None]
+        min_dist = cfg.reset_obstacle_clearance + dobs_state.radius
+        pushed_pos = start_pos[:2] + safe_dir * min_dist[:, None]
+        pushed_pos = jnp.clip(
+            pushed_pos,
+            -cfg.termination_xy_limit,
+            cfg.termination_xy_limit,
+        )
+        too_close = dist_from_start < min_dist
+        dobs_state = dobs_state.replace(
+            pos_xy=jnp.where(too_close[:, None], pushed_pos, dobs_state.pos_xy)
+        )
 
     thrust_hover = 9.81 * quadrotor._mass
     hovering_action = jnp.array([thrust_hover, 0.0, 0.0, 0.0])
@@ -665,7 +685,17 @@ def dynamic_avoidance_dva_adapter(
             progress
         ])
 
-        return DVAObservation(actor_obs=o, critic_obs=critic_obs)
+        actor_velocity = R.T @ vel / 5.0
+        actor_last_rates = o[223:226] / jnp.array([6.0, 6.0, 4.0])
+        actor_obs = jnp.concatenate([
+            jnp.clip(o[:216] / state.clearance_scale, 0.0, 1.0),
+            target_dir_body,
+            actor_velocity,
+            jnp.array([height_norm]),
+            actor_last_rates,
+        ])
+
+        return DVAObservation(actor_obs=actor_obs, critic_obs=critic_obs)
 
     # Handle batching
     if obs.ndim == 1:

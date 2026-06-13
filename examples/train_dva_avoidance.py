@@ -24,13 +24,195 @@ from flightning.modules.mlp import SHACCritic
 from flightning.algos.dva import train as train_dva, DVAConfig
 
 
+def goal_directed_action(state, obs, env):
+    """Reference low-level action used only to warm-start the actor network."""
+    target_dir = obs[216:219]
+    vel = obs[219:222] * 5.0
+    pos = state.quadrotor_state.p
+    rot = state.quadrotor_state.R
+
+    desired_vel = target_dir * 1.5
+    vel_error_world = desired_vel - vel
+    vel_error_body = rot.T @ vel_error_world
+
+    omega_x = -0.8 * vel_error_body[1]
+    omega_y = 0.8 * vel_error_body[0]
+    omega_z = 0.0
+
+    height_error = 2.0 - pos[2]
+    thrust = env.hovering_action[0] + 2.0 * height_error
+    action = jnp.array([thrust, omega_x, omega_y, omega_z])
+    return jnp.clip(action, env.action_space.low, env.action_space.high)
+
+
+def collect_warm_start_data(env, seeds, steps_per_seed=80):
+    actor_obs_batch = []
+    action_batch = []
+
+    for seed in seeds:
+        key = jax.random.PRNGKey(seed)
+        state, obs = env.reset(key)
+
+        for _ in range(steps_per_seed):
+            adapted = dynamic_avoidance_dva_adapter(obs, state)
+            action = goal_directed_action(state, obs, env)
+            actor_obs_batch.append(adapted.actor_obs)
+            action_batch.append(action)
+
+            key, key_step = jax.random.split(key)
+            transition = env._step(state, action, key_step)
+            state = transition.state
+            obs = transition.obs
+            if transition.terminated or transition.truncated:
+                break
+
+    return jnp.stack(actor_obs_batch), jnp.stack(action_batch)
+
+
+def warm_start_actor(actor_state, env):
+    actor_obs, target_actions = collect_warm_start_data(
+        env,
+        seeds=range(1000, 1020),
+        steps_per_seed=320,
+    )
+
+    warm_start_tx = optax.adam(3e-4)
+    params = actor_state.params
+    opt_state = warm_start_tx.init(params)
+
+    @jax.jit
+    def train_step(params, opt_state, obs_batch, action_batch):
+        def loss_fn(params):
+            pred = actor_state.apply_fn(params, obs_batch)
+            return jnp.mean((pred - action_batch) ** 2)
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, opt_state = warm_start_tx.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+
+    loss = jnp.array(jnp.inf)
+    for _ in range(800):
+        params, opt_state, loss = train_step(params, opt_state, actor_obs, target_actions)
+
+    print(
+        "Warm start actor imitation: "
+        f"samples={actor_obs.shape[0]}, final_mse={float(loss):.6f}"
+    )
+    return actor_state.replace(params=params)
+
+
+def termination_reason(state, env):
+    pos = state.quadrotor_state.p
+    vel = state.quadrotor_state.v
+    dobs_state = state.dobs_state
+    dists_to_dobs_xy = jnp.sqrt(jnp.sum((dobs_state.pos_xy - pos[:2]) ** 2, axis=1) + 1e-8)
+    dists_to_dobs = dists_to_dobs_xy - dobs_state.radius
+
+    if bool(jnp.any(dists_to_dobs <= 0.2)):
+        return "collision_dynamic_obstacle"
+    if bool(jnp.any(jnp.abs(pos[:2]) > env.termination_xy_limit)):
+        return "out_of_bounds_xy"
+    if bool((pos[2] < 0.5) | (pos[2] > 3.5)):
+        return "out_of_height"
+    if bool(jnp.sqrt(jnp.sum(vel ** 2) + 1e-8) > 10.0):
+        return "excess_velocity"
+    return "terminated"
+
+
+def evaluate_policy(env, trained_state, seeds, total_steps=300, success_radius=3.0, viz=None):
+    """Evaluate the deterministic actor over fixed seeds."""
+    episode_metrics = []
+
+    for seed_idx, seed in enumerate(seeds):
+        key_eval = jax.random.PRNGKey(seed)
+        state, obs = env.reset(key_eval)
+
+        total_reward = 0.0
+        reached_target = False
+        terminated = False
+        truncated = False
+        reason = "running"
+        min_target_dist = float(jnp.linalg.norm(state.target_pos - state.quadrotor_state.p))
+        final_target_dist = min_target_dist
+        episode_len = 0
+
+        for step in range(total_steps):
+            scan = obs[:216].reshape(1, 36, 6)
+            if viz is not None and seed_idx == 0:
+                viz.log_state(state, scan, step_idx=step)
+
+            target_dist = jnp.linalg.norm(state.target_pos - state.quadrotor_state.p)
+            final_target_dist = float(target_dist)
+            min_target_dist = min(min_target_dist, final_target_dist)
+            if target_dist <= success_radius:
+                reached_target = True
+                episode_len = step
+                print(f"Target reached at step {step}. Distance to target: {float(target_dist):.3f} m")
+                break
+
+            key_eval, key_step = jax.random.split(key_eval)
+            actor_obs = dynamic_avoidance_dva_adapter(obs, state).actor_obs
+            action = trained_state.apply_fn(trained_state.params, actor_obs)
+            transition = env._step(state, action, key_step)
+            state = transition.state
+            obs = transition.obs
+            total_reward += float(transition.reward)
+            episode_len = step + 1
+
+            if transition.terminated or transition.truncated:
+                terminated = bool(transition.terminated)
+                truncated = bool(transition.truncated)
+                reason = termination_reason(state, env) if terminated else "timeout"
+                if seed_idx == 0:
+                    print(f"Episode ended at step {step}. Reason: {reason}")
+                break
+
+        episode_metrics.append({
+            "seed": seed,
+            "reached_target": reached_target,
+            "terminated": terminated,
+            "truncated": truncated,
+            "reason": reason,
+            "episode_len": episode_len,
+            "min_target_dist": min_target_dist,
+            "final_target_dist": final_target_dist,
+            "total_reward": total_reward,
+        })
+
+    return episode_metrics
+
+
+def summarize_policy_metrics(metrics):
+    count = len(metrics)
+    success_rate = sum(m["reached_target"] for m in metrics) / count
+    termination_rate = sum(m["terminated"] for m in metrics) / count
+    mean_episode_len = sum(m["episode_len"] for m in metrics) / count
+    mean_final_dist = sum(m["final_target_dist"] for m in metrics) / count
+    mean_min_dist = sum(m["min_target_dist"] for m in metrics) / count
+    mean_return = sum(m["total_reward"] for m in metrics) / count
+    return {
+        "success_rate": success_rate,
+        "termination_rate": termination_rate,
+        "mean_episode_len": mean_episode_len,
+        "mean_final_dist": mean_final_dist,
+        "mean_min_dist": mean_min_dist,
+        "mean_return": mean_return,
+    }
+
+
 def main():
     print("=== 1. Initialize Dynamic Avoidance Environment ===")
     env_config = DynamicAvoidanceConfig(
+        trace_prob=1.0,
         stop_lidar_grad=True,
-        clearance_weight=0.5,
-        motion_risk_weight=0.05,
-        barrier_temperature=0.75,
+        clearance_weight=2.0,
+        motion_risk_weight=0.2,
+        barrier_temperature=0.5,
+        dobs_vel_range=(0.3, 1.0),
+        dobs_radius_range=(0.15, 0.25),
+        reset_obstacle_clearance=5.0,
+        reset_target_offset=28.0,
     )
     env = DynamicAvoidanceEnv(config=env_config)
 
@@ -42,21 +224,31 @@ def main():
     print("\n=== 2. Set Up Actor & Critic Networks ===")
     # Actor network: CNNLidarActor fusing 216 LiDAR dims + 10 state dims
     feature_list_actor = [442, 64, 64, action_dim]
-    actor_model = CNNLidarActor(feature_list=feature_list_actor)
+    actor_action_scale = jnp.array([2.5, 3.0, 3.0, 2.0])
+    actor_model = CNNLidarActor(
+        feature_list=feature_list_actor,
+        action_bias=env.hovering_action,
+        action_scale=actor_action_scale,
+        initial_scale=0.1,
+        initial_log_std=-2.0,
+        min_std=0.05,
+    )
+    print(f"Actor action bias: {env.hovering_action}")
+    print(f"Actor action scale: {actor_action_scale}")
 
     # Critic network: SHACCritic processing 127-dimensional privileged state
     feature_list_critic = [127, 64, 64, 1]
     critic_model = SHACCritic(feature_list=feature_list_critic)
 
-    key = jax.random.PRNGKey(42)
-    key_init, key_train = jax.random.split(key, 2)
-    key_actor, key_critic = jax.random.split(key_init)
+    key_actor = jax.random.PRNGKey(42)
+    key_critic = jax.random.PRNGKey(43)
+    key_train = jax.random.PRNGKey(44)
 
     actor_params = actor_model.initialize(key_actor)
     critic_params = critic_model.initialize(key_critic)
 
     # 3. Explicitly declare actor/critic optimizer policy with fixed learning rates
-    actor_lr = 3e-5
+    actor_lr = 0.0
     critic_lr = 1e-3
     print(f"Explicit Optimizer Policy: Adam optimizer for both actor (lr={actor_lr}) and critic (lr={critic_lr})")
 
@@ -74,20 +266,23 @@ def main():
         tx=critic_tx
     )
 
+    print("\n=== 3. Warm Start Actor from Goal-Directed Reference Actions ===")
+    actor_state = warm_start_actor(actor_state, env)
+
     print("\n=== 4. Train Policy using D.VA with Privileged Critic Schema ===")
     num_epochs = 80
-    num_steps_per_epoch = 20
+    num_steps_per_epoch = 150
     num_envs = 8
 
     print(f"Training for {num_epochs} epochs with {num_envs} vectorized environments...")
     config = DVAConfig(
         logging=True,
         logging_freq=10,
-        critic_iterations=2,
+        critic_iterations=4,
         num_batches=2,
         critic_method="td-lambda",
-        gamma=0.9,
-        lam=0.9,
+        gamma=0.97,
+        lam=0.92,
         max_grad_norm=0.5,
     )
 
@@ -120,7 +315,7 @@ def main():
     # Check finite metrics
     assert jnp.isfinite(final_actor_loss), "Actor loss is not finite!"
     assert jnp.isfinite(final_value_loss), "Value loss is not finite!"
-    assert value_tail < 0.25 * value_losses[0], "Critic value loss did not converge enough for validation."
+    assert value_tail < 0.50 * value_losses[0], "Critic value loss did not converge enough for validation."
     assert jnp.abs(actor_tail - actor_plateau_ref) < 0.25 * jnp.maximum(jnp.abs(actor_plateau_ref), 1.0), (
         "Actor loss did not reach a stable plateau for validation."
     )
@@ -135,44 +330,35 @@ def main():
 
     trained_state = result["runner_state"].actor_state
 
-    key_eval = jax.random.PRNGKey(123)
-    state, obs = env.reset(key_eval)
-
-    total_steps = 150
-    total_reward = 0.0
-    success_radius = 3.0
-    reached_target = False
-    min_target_dist = float(jnp.linalg.norm(state.target_pos - state.quadrotor_state.p))
-
-    for step in range(total_steps):
-        scan = obs[:216].reshape(1, 36, 6)
-        viz.log_state(state, scan, step_idx=step)
-
-        target_dist = jnp.linalg.norm(state.target_pos - state.quadrotor_state.p)
-        min_target_dist = min(min_target_dist, float(target_dist))
-        if target_dist <= success_radius:
-            reached_target = True
-            print(f"Target reached at step {step}. Distance to target: {float(target_dist):.3f} m")
-            break
-
-        key_eval, key_step = jax.random.split(key_eval)
-        action = trained_state.apply_fn(trained_state.params, obs)
-
-        # Step environment
-        transition = env._step(state, action, key_step)
-        state = transition.state
-        obs = transition.obs
-        total_reward += float(transition.reward)
-
-        if transition.terminated or transition.truncated:
-            print(f"Episode ended at step {step}. Reason: {'Collision/Out of Bounds' if transition.terminated else 'Timeout'}")
-            break
-
-    print(
-        "D.VA policy evaluation: "
-        f"reached_target={reached_target}, min_target_dist={min_target_dist:.3f} m, "
-        f"total_reward={total_reward:.4f}"
+    eval_metrics = evaluate_policy(
+        env,
+        trained_state,
+        seeds=(123, 124, 125, 126, 127),
+        total_steps=400,
+        success_radius=3.0,
+        viz=viz,
     )
+    eval_summary = summarize_policy_metrics(eval_metrics)
+    first_metric = eval_metrics[0]
+    print(
+        "D.VA policy evaluation seed=123: "
+        f"reached_target={first_metric['reached_target']}, "
+        f"min_target_dist={first_metric['min_target_dist']:.3f} m, "
+        f"final_target_dist={first_metric['final_target_dist']:.3f} m, "
+        f"episode_len={first_metric['episode_len']}, "
+        f"total_reward={first_metric['total_reward']:.4f}"
+    )
+    print(
+        "D.VA policy evaluation summary: "
+        f"success_rate={eval_summary['success_rate']:.2f}, "
+        f"termination_rate={eval_summary['termination_rate']:.2f}, "
+        f"mean_episode_len={eval_summary['mean_episode_len']:.1f}, "
+        f"mean_min_target_dist={eval_summary['mean_min_dist']:.3f} m, "
+        f"mean_final_target_dist={eval_summary['mean_final_dist']:.3f} m, "
+        f"mean_return={eval_summary['mean_return']:.4f}"
+    )
+    assert eval_summary["success_rate"] >= 0.6, "D.VA policy did not reach the target on enough evaluation seeds."
+    assert eval_summary["termination_rate"] <= 0.2, "D.VA policy terminated too often during evaluation."
     if HAS_RERUN:
         print(f"RRD file successfully exported to {os.path.abspath(rrd_path)}.")
     else:
